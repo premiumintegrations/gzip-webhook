@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: gzip-webhook
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: EXTERNAL_API_URL
+        value: https://httpbin.org/post  # replace with your real API later
