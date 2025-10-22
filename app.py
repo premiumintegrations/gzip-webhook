@@ -1,116 +1,115 @@
 from flask import Flask, request, jsonify
 import requests
 import gzip
-from io import BytesIO
 import os
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Simple endpoint to confirm the service is live."""
-    return jsonify({"status": "ok", "message": "gzip webhook is running"}), 200
+# Airtable configuration - set as environment variables in Render
+AIRTABLE_API_KEY = os.environ.get('AIRTABLE_API_KEY')
+AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID')
+AIRTABLE_TABLE_NAME = os.environ.get('AIRTABLE_TABLE_NAME')
 
+def gzip_file(input_path, output_path):
+    with open(input_path, 'rb') as f_in:
+        with gzip.open(output_path, 'wb') as f_out:
+            f_out.writelines(f_in)
+
+def upload_to_transfersh(file_path):
+    with open(file_path, 'rb') as f:
+        response = requests.put(
+            f'https://transfer.sh/{os.path.basename(file_path)}',
+            data=f
+        )
+        if response.status_code == 200:
+            return response.text.strip()
+        else:
+            print("Transfer.sh upload failed:", response.text)
+            return None
+
+def update_airtable_record(record_id, download_url):
+    headers = {
+        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    data = {
+        "fields": {
+            "G-Zipped File": [
+                {
+                    "url": download_url
+                }
+            ]
+        }
+    }
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}/{record_id}"
+    response = requests.patch(url, json=data, headers=headers)
+    return response.status_code, response.json()
 
 @app.route('/webhook', methods=['POST'])
-def gzip_and_upload_to_airtable():
-    """Main webhook: receives file_url and record_id from Airtable, gzips file, uploads to file.io, and updates Airtable."""
-    data = request.get_json() or {}
+def webhook():
+    data = request.get_json()
 
-    # --- Extract incoming values from request ---
     file_url = data.get('file_url')
     record_id = data.get('record_id')
 
-    # --- Load Airtable environment variables ---
-    airtable_key = os.environ.get("AIRTABLE_API_KEY")
-    base_id = os.environ.get("AIRTABLE_BASE_ID")
-    table_name = os.environ.get("AIRTABLE_TABLE_NAME")
-
-    # The Airtable field where gzipped file will be stored
-    airtable_field = "G-Zipped File"
-
-    # --- Validate and show debug info if something is missing ---
+    # Validate inputs and env vars
     missing = []
     if not file_url:
         missing.append("file_url (from Airtable POST body)")
     if not record_id:
         missing.append("record_id (from Airtable POST body)")
-    if not airtable_key:
-        missing.append("AIRTABLE_API_KEY (from Render environment)")
-    if not base_id:
-        missing.append("AIRTABLE_BASE_ID (from Render environment)")
-    if not table_name:
-        missing.append("AIRTABLE_TABLE_NAME (from Render environment)")
+    if not AIRTABLE_API_KEY:
+        missing.append("AIRTABLE_API_KEY (env)")
+    if not AIRTABLE_BASE_ID:
+        missing.append("AIRTABLE_BASE_ID (env)")
+    if not AIRTABLE_TABLE_NAME:
+        missing.append("AIRTABLE_TABLE_NAME (env)")
 
     if missing:
-        # Return helpful diagnostics
         return jsonify({
             "error": "Missing required parameters or environment variables",
             "missing_items": missing,
             "debug_values": {
                 "file_url": file_url,
                 "record_id": record_id,
-                "AIRTABLE_API_KEY_present": bool(airtable_key),
-                "AIRTABLE_BASE_ID_present": bool(base_id),
-                "AIRTABLE_TABLE_NAME_present": bool(table_name)
+                "AIRTABLE_API_KEY_present": AIRTABLE_API_KEY is not None,
+                "AIRTABLE_BASE_ID_present": AIRTABLE_BASE_ID is not None,
+                "AIRTABLE_TABLE_NAME_present": AIRTABLE_TABLE_NAME is not None,
             }
         }), 400
 
     try:
-        # --- Step 1: Download the original file ---
+        # Download the file
+        original_filename = secure_filename(file_url.split("/")[-1])
+        local_pdf = f"/tmp/{original_filename}"
         response = requests.get(file_url)
         response.raise_for_status()
-        original_data = response.content
 
-        # --- Step 2: Gzip the file ---
-        gzipped_io = BytesIO()
-        with gzip.GzipFile(fileobj=gzipped_io, mode='wb') as gz:
-            gz.write(original_data)
-        gzipped_io.seek(0)
+        with open(local_pdf, 'wb') as f:
+            f.write(response.content)
 
-        # --- Step 3: Upload to file.io anonymously ---
-        upload_response = requests.post(
-            'https://api.file.io/v2/files',
-            files={'file': ('document.pdf.gz', gzipped_io)},
-            data={'expires': '1d'}  # file expires after 1 day or 1 download
-        )
+        # Gzip the file
+        local_gz = f"{local_pdf}.gz"
+        gzip_file(local_pdf, local_gz)
 
-        upload_json = upload_response.json()
-        if not upload_json.get('data') or not upload_json['data'].get('link'):
-            return jsonify({
-                'error': 'Failed to upload to file.io',
-                'details': upload_json
-            }), 500
+        # Upload to transfer.sh
+        gz_url = upload_to_transfersh(local_gz)
+        if not gz_url:
+            return jsonify({"error": "Failed to upload to transfer.sh"}), 500
 
-        public_url = upload_json['data']['link']
+        # Update Airtable with the new link
+        status, airtable_response = update_airtable_record(record_id, gz_url)
 
-        # --- Step 4: Update Airtable record with the new file link ---
-        airtable_api_url = f"https://api.airtable.com/v0/{base_id}/{table_name}/{record_id}"
-        headers = {
-            "Authorization": f"Bearer {airtable_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "fields": {
-                airtable_field: [{"url": public_url}]
-            }
-        }
-
-        airtable_response = requests.patch(airtable_api_url, headers=headers, json=payload)
-        airtable_response.raise_for_status()
-
-        # --- Step 5: Return success response ---
         return jsonify({
-            "message": "Gzipped file uploaded and Airtable updated successfully",
-            "gzipped_url": public_url,
-            "record_id": record_id
-        }), 200
+            "status": "success",
+            "gz_url": gz_url,
+            "airtable_response": airtable_response
+        }), status
 
     except Exception as e:
-        # Catch-all error handler
         return jsonify({"error": str(e)}), 500
 
-
-if __name__ == "__main__":
-    # Flask debug server (for local testing)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "message": "gzip webhook is running"})
